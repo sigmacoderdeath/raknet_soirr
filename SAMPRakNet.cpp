@@ -122,77 +122,94 @@ static void DecryptKyretardize(uint8_t* buf, int len, uint16_t port) {
     }
 }
 
-// Главный пайплайн дешифрации (вызывать для входящих данных)
+// Вспомогательная функция для Unshuffle (теперь точно по листингу IDA)
+static void UnpermuteBlocks(uint8_t* buf, int len, uint8_t* out) {
+    int blockSize = (len - 5) / 4;
+    // Байты 1, 2, 3, 4 - это индексы, которые записал клиент через rand()
+    uint8_t* indices = buf + 1; 
+    uint8_t* dataBlocks = buf + 5; 
+
+    for (int i = 0; i < 4; i++) {
+        uint8_t originalIndex = indices[i];
+        // Важно: в EncryptOutcomingData было: dst[indices[i]] = block[i]
+        // Значит при дешифрации мы берем i-й блок из пакета и кладем его 
+        // на место, указанное в индексе.
+        if (originalIndex < 4) {
+            memcpy(out + originalIndex * blockSize, dataBlocks + i * blockSize, blockSize);
+        }
+    }
+}
+
+// Главный пайплайн
 bool SAMPRakNet::DecryptPacket(uint8_t* buf, int& len, uint16_t port) {
-    if (len < 5 || buf[0] != 0x1B) return false;
+    // 1. Проверка минимальной длины (Маркер + 4 индекса + минимум 1 байт данных)
+    if (len < 6 || buf[0] != 0x1B) return false;
 
     if (core_) {
-        core_->printLn("[NEW_DECRYPT] Processing packet 0x1B, len: %d", len);
+        core_->printLn("[NEW_DECRYPT] Packet Received. Len: %d", len);
     }
 
-    // --- ШАГ 1: XOR Слой (CAuthentication) ---
-    // Используем только ключ 0x57 для всего тела пакета
+    // 2. Слой XOR CAuthentication
+    // Листинг показал: весь пакет кроме первого байта XOR-ится значением m_PermutateParts (или константой)
+    // Попробуй 0x57, если индексы в логе ниже будут > 3, значит ключ другой.
     for (int i = 1; i < len; i++) {
         buf[i] ^= 0x57; 
     }
 
     if (core_) {
-        core_->printLn("[NEW_DECRYPT] Indices: %d %d %d %d", buf[1], buf[2], buf[3], buf[4]);
+        core_->printLn("[NEW_DECRYPT] Decrypted Indices: %d %d %d %d", buf[1], buf[2], buf[3], buf[4]);
     }
 
-    // --- ШАГ 2: Unshuffle (Восстановление блоков) ---
+    // 3. Unshuffle
     int blockSize = (len - 5) / 4;
     int dataSize = blockSize * 4;
     
     if (dataSize <= 0 || dataSize > MAXIMUM_MTU_SIZE) return false;
     
     uint8_t tmp[MAXIMUM_MTU_SIZE];
-    Unpermute(buf, len, tmp);
+    memset(tmp, 0, MAXIMUM_MTU_SIZE);
+    
+    UnpermuteBlocks(buf, len, tmp);
 
-    // --- ШАГ 3: TEA Дешифрация ---
-    // TEA работает только если есть хотя бы 8 байт
+    // 4. TEA Дешифрация
     if (dataSize >= 8) {
         for (int i = 0; i + 8 <= dataSize; i += 8) {
             TEA_Decrypt((uint32_t*)(tmp + i), tea_key);
         }
     }
 
-    // --- ШАГ 4: Kyretardize (XOR порта + S-Box) ---
-    // Согласно дампу kyretardizeDatagram: 
-    // Шифрование: SBox -> XOR. Дешифрация: XOR -> SBox.
-    
+    // 5. Kyretardize (XOR Порта + S-Box)
+    // unk в SendTo был 0, значит начинаем с false
     uint8_t pKey = (uint8_t)port;
-    bool usePortXor = false; // Начальное состояние unk = 0
+    bool usePortXor = false; 
 
     for (int i = 0; i < dataSize; i++) {
-        // 1. Убираем XOR порта (каждый второй байт)
+        // Убираем XOR (только для каждого второго байта)
         if (usePortXor) {
             tmp[i] ^= (pKey ^ 0xAA);
         }
         usePortXor = !usePortXor;
 
-        // 2. Инвертируем S-Box
+        // Инвертируем S-Box
         tmp[i] = inv_sbox[tmp[i]];
     }
 
-    // --- ШАГ 5: Финализация ---
-    // ВАЖНО: Первый байт (tmp[0]) — это контрольная сумма из kyretardizeDatagram.
-    // Настоящие данные начинаются с tmp[1].
-    
+    // 6. Финализация (Отрезаем чексумму)
+    // kyretardizeDatagram добавила 1 байт в начало tmp
     if (dataSize > 1) {
-        len = dataSize - 1; // Убираем байт чексуммы из длины
-        memcpy(buf, tmp + 1, len); // Копируем данные начиная со второго байта
+        len = dataSize - 1;
+        // Настоящий Packet ID теперь лежит в tmp[1]
+        memcpy(buf, tmp + 1, len);
     } else {
         return false;
     }
 
     if (core_) {
-        core_->printLn("[NEW_DECRYPT] Success! Packet ID: 0x%02X, Final Len: %d", buf[0], len);
+        core_->printLn("[NEW_DECRYPT] Final ID: 0x%02X, DataLen: %d", buf[0], len);
     }
     
     return true;
 }
-
 // Новый формат дешифрации (обновленный)
 uint8_t* SAMPRakNet::DecryptNewFormat(uint8_t const* src, int len) {
     if (!crypto_initialized) {
