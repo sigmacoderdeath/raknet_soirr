@@ -124,84 +124,70 @@ static void DecryptKyretardize(uint8_t* buf, int len, uint16_t port) {
 
 // Главный пайплайн дешифрации (вызывать для входящих данных)
 bool SAMPRakNet::DecryptPacket(uint8_t* buf, int& len, uint16_t port) {
-    if (buf[0] != 0x1B) return false;
+    if (len < 5 || buf[0] != 0x1B) return false;
 
     if (core_) {
-        core_->printLn("[NEW_DECRYPT] Processing packet with marker 0x1B, length: %d", len);
+        core_->printLn("[NEW_DECRYPT] Processing packet 0x1B, len: %d", len);
     }
 
-    // Шаг 1: XOR Слой CAuthentication
-    for (int i = 1; i < len; i++) buf[i] ^= 0x57;
+    // --- ШАГ 1: XOR Слой (CAuthentication) ---
+    // Используем только ключ 0x57 для всего тела пакета
+    for (int i = 1; i < len; i++) {
+        buf[i] ^= 0x57; 
+    }
 
-    // Проверка индексов после XOR
     if (core_) {
-        core_->printLn("[NEW_DECRYPT] After XOR - indices: %d %d %d %d", 
-            buf[1], buf[2], buf[3], buf[4]);
+        core_->printLn("[NEW_DECRYPT] Indices: %d %d %d %d", buf[1], buf[2], buf[3], buf[4]);
     }
 
-    // Шаг 2: Unshuffle блоков
+    // --- ШАГ 2: Unshuffle (Восстановление блоков) ---
     int blockSize = (len - 5) / 4;
     int dataSize = blockSize * 4;
     
-    if (core_) {
-        core_->printLn("[NEW_DECRYPT] Block size: %d, data size: %d", blockSize, dataSize);
-    }
-    
-    if (dataSize > MAXIMUM_MTU_SIZE) return false;
+    if (dataSize <= 0 || dataSize > MAXIMUM_MTU_SIZE) return false;
     
     uint8_t tmp[MAXIMUM_MTU_SIZE];
     Unpermute(buf, len, tmp);
 
-    // Вывод первых 8 байт после Unshuffle
-    if (core_ && dataSize >= 8) {
-        core_->printLn("[NEW_DECRYPT] After Unshuffle - first 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X", 
-            tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]);
-    }
-
-    // Шаг 3: TEA Дешифрация
-    for (int i = 0; i + 8 <= dataSize; i += 8) {
-        uint32_t* block = (uint32_t*)(tmp + i);
-        if (core_ && i == 0) {
-            core_->printLn("[NEW_DECRYPT] Before TEA - block[0]: 0x%08X, block[1]: 0x%08X", block[0], block[1]);
-        }
-        TEA_Decrypt(block, tea_key);
-        if (core_ && i == 0) {
-            core_->printLn("[NEW_DECRYPT] After TEA - block[0]: 0x%08X, block[1]: 0x%08X", block[0], block[1]);
+    // --- ШАГ 3: TEA Дешифрация ---
+    // TEA работает только если есть хотя бы 8 байт
+    if (dataSize >= 8) {
+        for (int i = 0; i + 8 <= dataSize; i += 8) {
+            TEA_Decrypt((uint32_t*)(tmp + i), tea_key);
         }
     }
 
-    // Вывод первых 8 байт после TEA
-    if (core_ && dataSize >= 8) {
-        core_->printLn("[NEW_DECRYPT] After TEA - first 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X", 
-            tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]);
+    // --- ШАГ 4: Kyretardize (XOR порта + S-Box) ---
+    // Согласно дампу kyretardizeDatagram: 
+    // Шифрование: SBox -> XOR. Дешифрация: XOR -> SBox.
+    
+    uint8_t pKey = (uint8_t)port;
+    bool usePortXor = false; // Начальное состояние unk = 0
+
+    for (int i = 0; i < dataSize; i++) {
+        // 1. Убираем XOR порта (каждый второй байт)
+        if (usePortXor) {
+            tmp[i] ^= (pKey ^ 0xAA);
+        }
+        usePortXor = !usePortXor;
+
+        // 2. Инвертируем S-Box
+        tmp[i] = inv_sbox[tmp[i]];
     }
 
-    // Шаг 4: Kyretardize (S-Box + Port XOR)
-    if (core_) {
-        core_->printLn("[NEW_DECRYPT] Port: %d, portMask: 0x%02X, portMask ^ 0xAA: 0x%02X", 
-            port, (uint8_t)port, (uint8_t)port ^ 0xAA);
-    }
+    // --- ШАГ 5: Финализация ---
+    // ВАЖНО: Первый байт (tmp[0]) — это контрольная сумма из kyretardizeDatagram.
+    // Настоящие данные начинаются с tmp[1].
     
-    // Вывод первых 8 байт до Kyretardize
-    if (core_ && dataSize >= 8) {
-        core_->printLn("[NEW_DECRYPT] Before Kyretardize - first 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X", 
-            tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]);
-    }
-    
-    DecryptKyretardize(tmp, dataSize, port);
-    
-    // Вывод первых 8 байт после Kyretardize
-    if (core_ && dataSize >= 8) {
-        core_->printLn("[NEW_DECRYPT] After Kyretardize - first 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X", 
-            tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]);
+    if (dataSize > 1) {
+        len = dataSize - 1; // Убираем байт чексуммы из длины
+        memcpy(buf, tmp + 1, len); // Копируем данные начиная со второго байта
+    } else {
+        return false;
     }
 
-    // Финал: Копируем очищенные данные в буфер
-    memcpy(buf, tmp, dataSize);
-    len = dataSize;
-    
     if (core_) {
-        core_->printLn("[NEW_DECRYPT] Decryption successful! First byte: 0x%02X, final length: %d", buf[0], len);
+        core_->printLn("[NEW_DECRYPT] Success! Packet ID: 0x%02X, Final Len: %d", buf[0], len);
     }
     
     return true;
